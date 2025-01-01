@@ -14,7 +14,7 @@ class ContextChatSystem:
         self.document_vectors = None
         self.tax_data = None
         self.reference_files = {
-            'tax_filings': './ingestion_pipeline/datasets/sample_rag.csv',
+            'tax_filings': 'sample_rag.csv',
             # 'organizations': './ingestion_pipeline/datasets/organizations_basic_data.csv'
             # Add more reference files as needed
         }
