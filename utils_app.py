@@ -8,7 +8,7 @@ load_dotenv()
 
 class TaxAnalyzer:
     def __init__(self):
-        self.client = Anthropic(api_key=st.secrets("ANTHROPIC_API_KEY"))
+        self.client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
     def analyze(self, df: pd.DataFrame, query: str) -> str:
         """
