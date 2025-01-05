@@ -1,65 +1,117 @@
-from utils_rag import *
+from utils_app import *
 import streamlit as st
+from datetime import datetime
+import pandas as pd
+import sqlite3
 
-st.set_page_config(page_title="Tax Filing Chat Assistant", layout="wide")
 
-initialize_session_state()
+def get_db_data(query=None):
+    """Retrieve data from SQLite database"""
+    conn = sqlite3.connect("tax_data.db")
+    if query is None:
+        query = """
+        SELECT *
+        FROM tax_form_basic_data
+        """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
 
-st.title("Tax Filing Chat Assistant")
 
-# Sidebar for configuration
-with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("Enter Anthropic API Key:", type="password")
-    # uploaded_file = st.file_uploader("Upload Tax Filings CSV", type=['csv'])
+# Initialize session state for chat history
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
 
-    if st.button("Initialize Chat System") and api_key: # and uploaded_file:
-        with st.spinner("Initializing chat system..."):
-            st.session_state.chat_system = ContextChatSystem(api_key)
-            # st.session_state.chat_system.load_data(uploaded_file)
-            st.success("Chat system initialized!")
+# Streamlit Interface
+st.title("📊 Nonprofit Tax Record Analysis")
 
-# Display chat history
-chat_container = st.container()
-with chat_container:
-    for message in st.session_state.chat_history:
-        role = message["role"]
-        content = message["content"]
+try:
+    # Read from database
+    df = get_db_data()
 
-        if role == "user":
-            st.write(f"**You**: {content}")
-        else:
-            st.write(f"**Assistant**: {content}")
+    with st.expander("📋 Data Preview"):
+        st.dataframe(df.head())
 
-# Chat input
-user_input_key = f"user_input{len(st.session_state.chat_history)}"
-user_input = st.text_input("Ask a question about the tax filings:", key=user_input_key)
+    # Ensure 'total_revenue' column is numeric
+    df['total_revenue'] = pd.to_numeric(df['total_revenue'], errors='coerce')
 
-if st.button("Send") and user_input:
-    with st.spinner("Getting response..."):
-        try:
-            # Add user message to chat history
+    # Display basic stats
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Records", len(df))
+    with col2:
+        st.metric("Organizations", df['business_name'].nunique())
+    with col3:
+        avg_revenue = df['total_revenue'].mean()
+        st.metric("Avg Revenue", f"${avg_revenue:,.2f}")
+
+    # Create analyzer
+    analyzer = TaxAnalyzer()
+
+    # Query input
+    query = st.text_input("💭 What would you like to know about the tax records?")
+
+    if query:
+        with st.spinner("Analyzing..."):
+            # Get analysis
+            analysis = analyzer.analyze(df, query)
+
+            # Add to chat history
+            timestamp = datetime.now().strftime("%H:%M")
             st.session_state.chat_history.append({
-                "role": "user",
-                "content": user_input
+                "timestamp": timestamp,
+                "query": query,
+                "response": analysis
             })
 
-            # Get response from Claude
-            response = st.session_state.chat_system.get_response(user_input)
+    # Display chat history
+    st.markdown("### 💬 Conversation History")
+    for chat in st.session_state.chat_history:
+        # Query
+        st.markdown(f"""
+        <div style="padding: 10px; margin: 5px 0; border-radius: 5px; background-color: #f0f2f6;">
+            <span style="color: #666;">🕒 {chat['timestamp']}</span><br>
+            <span style="color: #333;">❓ <b>Question:</b> {chat['query']}</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-            # Add assistant response to chat history
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": response
-            })
+        # Response
+        st.markdown(f"""
+        <div style="padding: 10px; margin: 5px 0; border-radius: 5px; background-color: #e8f4ea;">
+            <span style="color: #333;">💡 <b>Analysis:</b><br>{chat['response']}</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-            # Rerun to update chat display
-            st.rerun()
+        # Divider
+        st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px solid #eee;'>",
+                    unsafe_allow_html=True)
 
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
+except Exception as e:
+    st.error(f"Error accessing database: {str(e)}")
+    st.write("Please ensure the database is properly initialized with tax records.")
 
-# Add a clear chat button
-if st.button("Clear Chat"):
+# Add helpful information in a clean format
+st.sidebar.markdown("""
+# 📚 Guide
+
+### 🎯 About This Tool
+Analyzes nonprofit tax records (Form 990) with natural language queries.
+
+### 💡 Example Questions
+- 🏢 What is the organization's business name?
+- 👥 How many volunteers and employees are there?
+- 💰 What is the total executive compensation?
+- 📈 What are the total contributions?
+
+### 📊 Available Information
+- Organization details
+- Financial data
+- Employee counts
+- Compensation data
+- Contributions
+""")
+
+# Add clear button for chat history
+if st.sidebar.button("🗑️ Clear Chat History"):
     st.session_state.chat_history = []
     st.rerun()
