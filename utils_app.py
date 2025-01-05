@@ -12,47 +12,38 @@ class TaxAnalyzer:
 
     def analyze(self, df: pd.DataFrame, query: str) -> str:
         """
-        Analyze the tax records based on the query using direct context
+        Simply provide the data context and let Claude analyze it directly
         """
-        # Create a more informative context string
+        # Create context with full relevant data
         context = f"""
+        Available Records:
+        {df.to_string()}
+
         Data Summary:
         - Total Records: {len(df)}
         - Unique Organizations: {df['business_name'].nunique()}
-        - Date Range: {df['tax_period_begin'].min()} to {df['tax_period_end'].max()}
-        
-        Sample Record:
-        {df}
-        
-        Available Metrics:
-        Financial: total_revenue, total_expenses, total_contributions, program_service_revenue
-        Efficiency: operating_margin, program_efficiency
-        Personnel: total_volunteers, total_employees
-        Assets: total_assets_eoy, total_liabilities_eoy
+        - Available Columns: {', '.join(df.columns.tolist())}
         """
 
-        # Get analysis from Claude
+        # Get analysis from Claude with minimal processing
         response = self.client.messages.create(
             model="claude-3-sonnet-20240229",
-            system="You are a tax analysis assistant specializing in nonprofit tax records (Form 990). "
-                   "Provide clear, accurate analysis based on the provided data. "
-                   "When answering questions, reference specific numbers and fields from the data. "
-                   "If certain information is not available in the provided data, clearly state that. "
-                   "Provide your response in clear, natural language without any special formatting or markers.",
+            system="You are analyzing tax records. Look at the provided data carefully and answer questions directly "
+                   "based on the records shown. If you see the information in the data, report it exactly as shown. "
+                   "Do not try to calculate or estimate values - only report what you directly observe in the records.",
             messages=[
                 {"role": "user", "content": f"""
-                Based on these nonprofit tax records:
+                Here are the tax records:
 
                 {context}
 
                 Question: {query}
 
-                Please provide a clear, specific answer using the available data."""}
+                Look at the records carefully and answer based on what you see in the data."""}
             ],
             max_tokens=1000
         )
 
-        ## tidying the response
         formatted_response = ""
         for item in response.content:
             formatted_response += item.text.replace("\\n", "\n").replace("(", "").replace(")", "") + "\n"
