@@ -33,7 +33,7 @@ def get_db_data(query=None):
 
 class TaxAnalyzer:
     def __init__(self):
-        self.client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+        self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         self.conversation_history = []
 
     def get_summary_stats(self, df, columns_of_interest=None):
@@ -60,21 +60,23 @@ class TaxAnalyzer:
             keywords = ["peer", "compare"]
             needs_comparison = any(keyword in query.lower() for keyword in keywords)
 
+            # Start with minimal context
+            context = "Analysis Context:\n\n"
+            context += f"Dataset Overview:\n"
+            context += f"Total Organizations: {df_x['business_name'].nunique()}\n"
+            context += f"Date Range: {df_x['tax_period_begin'].min()} to {df_x['tax_period_end'].max()}\n\n"
+
             if needs_comparison:
-                # Use optimized comparison approach
-                context = "Analysis Context:\n\n"
-
-                # Basic metadata
-                context += f"Dataset Overview:\n"
-                context += f"Total Organizations: {df_x['business_name'].nunique()}\n"
-                context += f"Date Range: {df_x['tax_period_begin'].min()} to {df_x['tax_period_end'].max()}\n\n"
-
                 # Get most recent year's data for comparison
                 latest_year = df_x['tax_period_end'].max()
                 recent_data = df_x[df_x['tax_period_end'] == latest_year]
 
-                # Calculate summary stats
-                stats = self.get_summary_stats(recent_data)
+                # Calculate and include only relevant summary stats
+                relevant_columns = [
+                    'total_revenue', 'total_expenses', 'program_service_expenses',
+                    'admin_expenses', 'fundraising_expenses'
+                ]
+                stats = self.get_summary_stats(recent_data, relevant_columns)
 
                 context += "Industry Statistics (Most Recent Year):\n"
                 for metric, values in stats.items():
@@ -91,7 +93,7 @@ class TaxAnalyzer:
                     selected_data = df[df['tax_period_end'] == latest_year]
                     if not selected_data.empty:
                         context += "\nSelected Organization Metrics:\n"
-                        for col in stats.keys():
+                        for col in relevant_columns:
                             if col in selected_data.columns:
                                 value = selected_data[col].iloc[0]
                                 if pd.notnull(value):
@@ -100,83 +102,61 @@ class TaxAnalyzer:
                                                                                'liabilities']) else f"{value:,.2f}"
                                     context += f"- {col}: {formatted_value}\n"
             else:
-                # Use original approach for non-comparison queries
-                context = "Complete Database Records:\n\n"
+                # For non-comparison queries, only include relevant data for the selected EIN
+                if ein_selected != "General Context":
+                    selected_df = df[df['ein'] == ein_selected].copy()
+                    if not selected_df.empty:
+                        # Get most recent record
+                        latest_record = selected_df.loc[selected_df['tax_period_end'].idxmax()]
+                        context += f"\nMost Recent Data for {latest_record['business_name']}:\n"
 
-                # Add metadata about the dataset
-                context += f"Dataset Overview:\n"
-                context += f"- Total Organizations: {df['business_name'].nunique()}\n"
-                context += f"- Total Records: {len(df)}\n"
-                context += f"- Date Range: {df['tax_period_begin'].min()} to {df['tax_period_end'].max()}\n\n"
+                        # Include only the most relevant fields
+                        relevant_fields = [
+                            'business_name', 'tax_period_end', 'total_revenue',
+                            'total_expenses', 'program_service_expenses', 'admin_expenses',
+                            'fundraising_expenses', 'total_assets', 'total_liabilities',
+                            'net_assets', 'employee_count', 'volunteer_count'
+                        ]
 
-                # Add complete records with ALL columns
-                for _, row in df.iterrows():
-                    context += f"\nOrganization: {row['business_name']}\n"
-                    for column in df.columns:
-                        if pd.notnull(row[column]):
-                            if isinstance(row[column], (int, float)):
-                                value = f"${row[column]:,.2f}" if any(term in column.lower() for term in
-                                                                      ['revenue', 'expenses', 'compensation', 'assets',
-                                                                       'liabilities']) else f"{row[column]:,}"
-                            else:
-                                value = row[column]
-                            context += f"- {column}: {value}\n"
-                    context += "-" * 50 + "\n"
-
-            # Add conversation history for both approaches
-            if self.conversation_history:
-                context += "\nPrevious Conversation Context:\n"
-                for q, a in self.conversation_history[-3:]:
-                    context += f"\nQ: {q}\nA: {a}\n"
-                context += "-" * 50 + "\n"
-
-            # Add selected EIN context if not "General Context"
-            if ein_selected != "General Context" and not needs_comparison:
-                selected_df = df[df['ein'] == ein_selected]
-                if not selected_df.empty:
-                    context += "\nSelected EIN Context:\n"
-                    for _, row in selected_df.iterrows():
-                        context += f"\nOrganization: {row['business_name']}\n"
-                        for column in selected_df.columns:
-                            if pd.notnull(row[column]):
-                                if isinstance(row[column], (int, float)):
-                                    value = f"${row[column]:,.2f}" if any(term in column.lower() for term in
-                                                                          ['revenue', 'expenses', 'compensation',
-                                                                           'assets',
-                                                                           'liabilities']) else f"{row[column]:,}"
+                        for field in relevant_fields:
+                            if field in latest_record.index and pd.notnull(latest_record[field]):
+                                value = latest_record[field]
+                                if isinstance(value, (int, float)):
+                                    formatted_value = f"${value:,.2f}" if any(term in field.lower() for term in
+                                                                              ['revenue', 'expenses', 'assets',
+                                                                               'liabilities']) else f"{value:,}"
                                 else:
-                                    value = row[column]
-                                context += f"- {column}: {value}\n"
-                        context += "-" * 50 + "\n"
+                                    formatted_value = value
+                                context += f"- {field}: {formatted_value}\n"
 
-            # Get analysis from Claude with appropriate system message
-            system_message = """You are analyzing nonprofit tax records with access to complete financial and operational data. For each analysis:
-                1. Use ALL available metrics (financial, operational, and organizational)
-                2. Consider key performance indicators like:
-                   - Revenue streams (contributions, program service, other)
-                   - Operational metrics (employees, volunteers, voting members)
-                   - Financial health (assets, liabilities, net assets)
-                   - Efficiency metrics (operating margin, program efficiency)
-                3. Compare organizations when relevant
-                4. Reference specific data points to support insights
-                5. Consider historical context from previous conversations
+            # Add only the last 2 relevant conversation items
+            if self.conversation_history:
+                context += "\nRecent Conversation Context:\n"
+                for q, a in self.conversation_history[-2:]:
+                    context += f"\nQ: {q}\nA: {a}\n"
 
-                Make full use of ALL available data fields to provide comprehensive analysis."""
+            # System message focused on efficiency analysis
+            system_message = """You are analyzing nonprofit tax records with a focus on program efficiency. For each analysis:
+                1. Calculate and compare program efficiency ratios:
+                   - Program spending ratio (program expenses / total expenses)
+                   - Administrative expense ratio
+                   - Fundraising efficiency
+                2. Compare against peer organizations when relevant
+                3. Provide specific data-backed insights
+                4. Suggest potential areas for improvement
+                5. Keep responses concise and focused on key metrics"""
 
             response = self.client.messages.create(
                 model="claude-3-sonnet-20240229",
                 system=system_message,
                 messages=[{
                     "role": "user",
-                    "content": f"Using the complete tax records and our conversation history:\n\n{context}\n\nQuestion: {query}"
+                    "content": f"Based on the following tax records:\n\n{context}\n\nQuestion: {query}"
                 }],
                 max_tokens=1500
             )
 
-            # Fixed response handling
             answer = response.content[0].text if response.content else "Unable to generate analysis"
-
-            # Clean up formatting
             answer = answer.replace("$,", "$").replace("  ", " ").replace(" .", ".")
 
             self.conversation_history.append((query, answer))
