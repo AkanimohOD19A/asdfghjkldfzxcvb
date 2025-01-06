@@ -1,105 +1,134 @@
 import os
+import sqlite3
 import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 from anthropic import Anthropic
+from fuzzywuzzy import fuzz
+from datetime import datetime
+
 load_dotenv()
+
+
+def get_db_data(query=None):
+    """Retrieve data from SQLite database with improved error handling"""
+    try:
+        conn = sqlite3.connect("tax_data.db")
+        if query is None:
+            query = """
+            SELECT *
+            FROM tax_form_basic_data
+            ORDER BY tax_period_end DESC
+            """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return pd.DataFrame()
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 
 class TaxAnalyzer:
     def __init__(self):
-        self.client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+        self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        # self.client = Anthropic(api_key=st.secrets("ANTHROPIC_API_KEY"))
+        self.conversation_history = []
 
-    def is_predictive_query(self, query: str) -> bool:
-        """Check if query is asking for predictions/projections"""
-        predictive_terms = ['predict', 'projection', 'estimate', 'forecast', 'future',
-                          'next year', 'trend', 'expected', 'outlook', 'potential']
-        return any(term in query.lower() for term in predictive_terms)
-
-    def get_relevant_records(self, df: pd.DataFrame, query: str) -> pd.DataFrame:
-        """Get relevant records with historical context for predictions if needed"""
-        query_lower = query.lower()
-
-        # If query contains an EIN, filter by it
-        if 'ein:' in query_lower or 'ein' in query_lower:
-            ein_val = ''.join(c for c in query_lower if c.isdigit())
-            if ein_val and 'ein' in df.columns:
-                return df[df['ein'].astype(str) == ein_val].sort_values('tax_period_end')
-
-        # For predictive queries, ensure we have historical context
-        if self.is_predictive_query(query):
-            # Get last 3-5 years of data for the relevant organization/metric
-            return df.sort_values('tax_period_end', ascending=True).tail(5)
-
-        # For regular queries, limit to most relevant recent records
-        return df.sort_values('tax_period_end', ascending=False).head(3)
-
-    def create_context(self, df: pd.DataFrame, relevant_records: pd.DataFrame, query: str) -> str:
-        """Create context with trend information for predictions if needed"""
-        if self.is_predictive_query(query):
-            # Calculate year-over-year changes for key metrics
-            if len(relevant_records) > 1:
-                records_summary = "Historical Trends:\n"
-                for col in ['total_revenue', 'total_expenses', 'total_contributions']:
-                    if col in relevant_records.columns:
-                        records_summary += f"\n{col.replace('_', ' ').title()}:\n"
-                        prev_value = None
-                        for _, row in relevant_records.iterrows():
-                            current_value = row[col]
-                            if prev_value is not None and prev_value != 0:
-                                pct_change = ((current_value - prev_value) / prev_value) * 100
-                                records_summary += f"{row['tax_period_end']}: ${current_value:,.2f} ({pct_change:+.1f}%)\n"
-                            else:
-                                records_summary += f"{row['tax_period_end']}: ${current_value:,.2f}\n"
-                            prev_value = current_value
-            else:
-                records_summary = relevant_records.to_string(index=False)
-        else:
-            records_summary = relevant_records.to_string(index=False)
-
-        context = f"""
-        {records_summary}
-        
-        Summary:
-        - Records Shown: {len(relevant_records)}
-        - Time Range: {relevant_records['tax_period_begin'].min()} to {relevant_records['tax_period_end'].max()}
-        """
-        return context
-
-    def analyze(self, df: pd.DataFrame, query: str) -> str:
-        """Analyze tax records with prediction support"""
+    def analyze(self, df: pd.DataFrame, df_x: pd.DataFrame, query: str, ein_selected: str) -> str:
+        """Analyze using complete database records and conversation history"""
         try:
-            # Get relevant subset of records
-            relevant_records = self.get_relevant_records(df, query)
-            context = self.create_context(df, relevant_records, query)
+            # Determine if the query requires peer comparison
+            keywords = ["peer",
+                        "compare"]  # , "benchmark", "contrast", "evaluate", "examine", "juxtapose", "measure", "weigh", "analyze"]
+            use_df_x = any(keyword in query.lower() for keyword in keywords)
 
-            # Adjust system prompt based on query type
-            if self.is_predictive_query(query):
-                system_prompt = """You are analyzing nonprofit tax records to provide insights and projections.
-                For predictive questions:
-                1. Use historical trends to inform predictions
-                2. Consider growth rates and patterns in the data
-                3. Provide realistic ranges rather than exact numbers
-                4. Include key factors that could impact future performance
-                5. Note relevant assumptions and limitations
-                
-                Base all analysis on the provided historical data."""
-            else:
-                system_prompt = """You are analyzing tax records. Answer questions directly based on the records shown.
-                Only report information that is explicitly present in the data."""
+            # Select the appropriate DataFrame
+            context_df = df_x if use_df_x else df
+
+            # Create comprehensive context with ALL data
+            context = "Complete Database Records:\n\n"
+
+            # Add metadata about the dataset
+            context += f"Dataset Overview:\n"
+            context += f"- Total Organizations: {context_df['business_name'].nunique()}\n"
+            context += f"- Total Records: {len(context_df)}\n"
+            context += f"- Date Range: {context_df['tax_period_begin'].min()} to {context_df['tax_period_end'].max()}\n\n"
+
+            # Add complete records with ALL columns
+            for _, row in context_df.iterrows():
+                context += f"\nOrganization: {row['business_name']}\n"
+                # Include every single column and its value
+                for column in context_df.columns:
+                    if pd.notnull(row[column]):  # Only include non-null values
+                        # Format numbers with commas and decimals
+                        if isinstance(row[column], (int, float)):
+                            value = f"${row[column]:,.2f}" if 'revenue' in column or 'expenses' in column or 'compensation' in column or 'assets' in column or 'liabilities' in column else f"{row[column]:,}"
+                        else:
+                            value = row[column]
+                        context += f"- {column}: {value}\n"
+                context += "-" * 50 + "\n"  # Separator between organizations
+
+            # Add conversation history
+            if self.conversation_history:
+                context += "\nPrevious Conversation Context:\n"
+                for q, a in self.conversation_history[-3:]:
+                    context += f"\nQ: {q}\nA: {a}\n"
+                context += "-" * 50 + "\n"
+
+            # Add selected EIN context if not "General Context"
+            if ein_selected != "General Context":
+                selected_df = df[df['ein'] == ein_selected]
+                if not selected_df.empty:
+                    context += "\nSelected EIN Context:\n"
+                    for _, row in selected_df.iterrows():
+                        context += f"\nOrganization: {row['business_name']}\n"
+                        for column in selected_df.columns:
+                            if pd.notnull(row[column]):  # Only include non-null values
+                                if isinstance(row[column], (int, float)):
+                                    value = f"${row[column]:,.2f}" if 'revenue' in column or 'expenses' in column or 'compensation' in column or 'assets' in column or 'liabilities' in column else f"{row[column]:,}"
+                                else:
+                                    value = row[column]
+                                context += f"- {column}: {value}\n"
+                        context += "-" * 50 + "\n"
 
             # Get analysis from Claude
             response = self.client.messages.create(
                 model="claude-3-sonnet-20240229",
-                system=system_prompt,
+                system="""You are analyzing nonprofit tax records with access to complete financial and operational data. For each analysis:
+                1. Use ALL available metrics (financial, operational, and organizational)
+                2. Consider key performance indicators like:
+                   - Revenue streams (contributions, program service, other)
+                   - Operational metrics (employees, volunteers, voting members)
+                   - Financial health (assets, liabilities, net assets)
+                   - Efficiency metrics (operating margin, program efficiency)
+                3. Compare organizations when relevant
+                4. Reference specific data points to support insights
+                5. Consider historical context from previous conversations
+
+                Make full use of ALL available data fields to provide comprehensive analysis.""",
                 messages=[{
                     "role": "user",
-                    "content": f"Based on these tax records:\n\n{context}\n\nQuestion: {query}"
+                    "content": f"Using the complete tax records and our conversation history:\n\n{context}\n\nQuestion: {query}"
                 }],
-                max_tokens=1000
+                max_tokens=1500
             )
 
-            return " ".join(item.text for item in response.content)
+            # Update conversation history
+            answer = " ".join(item.text for item in response.content)
+
+            # Clean up any markdown formatting issues
+            answer = answer.replace("$,", "$")  # Fix currency formatting
+            answer = answer.replace("  ", " ")  # Remove double spaces
+            answer = answer.replace(" .", ".")   # Fix spacing before periods
+
+            self.conversation_history.append((query, answer))
+            if len(self.conversation_history) > 10:
+                self.conversation_history.pop(0)
+
+            return answer
 
         except Exception as e:
             return f"Error analyzing records: {str(e)}"
